@@ -1702,8 +1702,13 @@ void ReplicatedPG::do_op(OpRequestRef& op)
       return;
   }
 
-  if (!(m->has_flag(CEPH_OSD_FLAG_IGNORE_CACHE)) &&
-      maybe_handle_cache(op, write_ordered, obc, r, missing_oid, false, in_hit_set))
+  if (maybe_handle_cache(op,
+			 write_ordered,
+			 obc,
+			 r,
+			 missing_oid,
+			 false,
+			 in_hit_set))
     return;
 
   if (r && (r != -ENOENT || !obc)) {
@@ -1939,6 +1944,14 @@ bool ReplicatedPG::maybe_handle_cache(OpRequestRef op,
 				      bool must_promote,
 				      bool in_hit_set)
 {
+  if (op &&
+      op->get_req() &&
+      op->get_req()->get_type() == CEPH_MSG_OSD_OP &&
+      (static_cast<MOSDOp *>(op->get_req())->get_flags() &
+       CEPH_OSD_FLAG_IGNORE_CACHE)) {
+    dout(20) << __func__ << ": ignoring cache due to flag" << dendl;
+    return false;
+  }
   // return quickly if caching is not enabled
   if (pool.info.cache_mode == pg_pool_t::CACHEMODE_NONE)
     return false;
@@ -1977,20 +1990,22 @@ bool ReplicatedPG::maybe_handle_cache(OpRequestRef op,
   MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
   const object_locator_t& oloc = m->get_object_locator();
 
-  if (must_promote || op->need_promote()) {
-    promote_object(obc, missing_oid, oloc, op);
-    return true;
-  }
-
   if (op->need_skip_handle_cache()) {
     return false;
   }
 
-  // older versions do not proxy the feature bits.
-  bool can_proxy_read = get_osdmap()->get_up_osd_features() &
-    CEPH_FEATURE_OSD_PROXY_FEATURES;
-  bool can_proxy_write = get_osdmap()->get_up_osd_features() &
-    CEPH_FEATURE_OSD_PROXY_WRITE_FEATURES;
+  // we can proxy the op if all osds support proxying the features and
+  // we are not required to promote
+  bool can_proxy_read =
+    (get_osdmap()->get_up_osd_features() & CEPH_FEATURE_OSD_PROXY_FEATURES) &&
+    !must_promote &&
+    !op->need_promote();
+  bool can_proxy_write =
+    (get_osdmap()->get_up_osd_features() &
+     CEPH_FEATURE_OSD_PROXY_WRITE_FEATURES) &&
+    !must_promote &&
+    !op->need_promote();
+
   OpRequestRef promote_op;
 
   switch (pool.info.cache_mode) {
@@ -8588,6 +8603,16 @@ int ReplicatedPG::find_object_context(const hobject_t& oid,
       *pobc = obc;
       return 0;
     }
+
+    if (pool.info.cache_mode != pg_pool_t::CACHEMODE_NONE) {
+      // cache tier does not necessarily have it.
+      ObjectContextRef obc = get_object_context(oid, can_create);
+      if (obc) {
+	*pobc = obc;
+	return 0;
+      }
+    }
+
     dout(10) << "find_object_context  " << head
 	     << " want " << oid.snap << " > snapset seq " << ssc->snapset.seq
 	     << " but head dne -- DNE"
